@@ -14,15 +14,18 @@ const Str = (strx)           => ({ctor:"Str",strx});
 const Nat = (natx)           => ({ctor:"Nat",natx});
 
 var is_prim = {
-  Unit   : 1,
-  Bool   : 1,
-  Nat    : 1,
-  Bits   : 1,
-  U16    : 1,
-  U32    : 1,
-  U64    : 1,
-  F64    : 1,
-  String : 1
+  Unit     : 1,
+  Bool     : 1,
+  Nat      : 1,
+  Bits     : 1,
+  U8       : 1,
+  U16      : 1,
+  U32      : 1,
+  U64      : 1,
+  U256     : 1,
+  F64      : 1,
+  String   : 1,
+  Buffer32 : 1,
 };
 
 function stringify(term) {
@@ -44,20 +47,27 @@ function stringify(term) {
 
 function as_adt(term, defs) {
   var term = fmc.reduce(term, defs);
-  if (term.ctor === "All" && term.self !== "") {
+  if (term.ctor === "All" && term.self.slice(0,5) === "self_") {
     var term = term.body(fmc.Var("self"), fmc.Var("P"));
     var ctrs = [];
     while (term.ctor === "All") {
       var ctr = (function go(term, flds) {
         if (term.ctor === "All") {
-          return go(term.body(fmc.Var(""), fmc.Var(term.name)), flds.concat(term.name));
-        } else if (term.ctor === "App" && term.func.ctor === "Var" && term.func.indx === "P") {
-          var argm = term.argm;
-          while (argm.ctor === "App") {
-            argm = argm.func;
-          };
-          if (argm.ctor === "Ref") {
-            return {name: argm.name, flds: flds};
+          var flds = term.eras ? flds : flds.concat(term.name);
+          return go(term.body(fmc.Var(""), fmc.Var(term.name)), flds);
+        } else if (term.ctor === "App") {
+          var func = term.func;
+          while (func.ctor === "App") {
+            func = func.func;
+          }
+          if (func.ctor === "Var" && func.indx === "P") {
+            var argm = term.argm;
+            while (argm.ctor === "App") {
+              argm = argm.func;
+            };
+            if (argm.ctor === "Ref") {
+              return {name: argm.name, flds: flds};
+            }
           }
         }
         return null;
@@ -163,7 +173,6 @@ function infer(term, defs, ctx = fmc.Nil()) {
           var argm_cmp = check(term.argm, func_typ.bind, defs, ctx);
           var term_typ = func_typ.body(self_var, name_var);
           var comp = func_cmp.comp;
-
           var func_typ_adt = as_adt(func_typ, defs);
           var func_typ_prim = prim_of(func_typ, defs);
           if (func_typ_prim) {
@@ -180,11 +189,11 @@ function infer(term, defs, ctx = fmc.Nil()) {
       };
     case "Let":
       var expr_cmp = infer(term.expr, defs, ctx);
-      var expr_var = fmc.Ann(true, term.dups ? fmc.Var(term.name+"#"+(ctx.size+1)) : term.expr, expr_cmp.type);
+      var expr_var = fmc.Ann(true, fmc.Var(term.name+"#"+(ctx.size+1)), expr_cmp.type);
       var body_ctx = fmc.Ext({name:term.name,type:expr_var.type}, ctx);
       var body_cmp = infer(term.body(expr_var), defs, body_ctx);
       return {
-        comp: term.dups ? Let(term.name+"$"+(ctx.size+1), expr_cmp.comp, body_cmp.comp) : body_cmp.comp,
+        comp: Let(term.name+"$"+(ctx.size+1), expr_cmp.comp, body_cmp.comp),
         type: body_cmp.type,
       };
     case "All":
@@ -237,7 +246,6 @@ function check(term, type, defs, ctx = fmc.Nil()) {
         } else {
           comp = Lam(term.name+"$"+(ctx.size+1), body_cmp.comp);
         }
-
         var type_adt = as_adt(type, defs);
         var type_prim = prim_of(type, defs);
         if (type_prim) {
@@ -251,11 +259,11 @@ function check(term, type, defs, ctx = fmc.Nil()) {
       return {comp, type};
     case "Let":
       var expr_cmp = infer(term.expr, defs, ctx);
-      var expr_var = fmc.Ann(true, term.dups ? fmc.Var(term.name+"#"+(ctx.size+1)) : term.expr, expr_cmp.type);
+      var expr_var = fmc.Ann(true, fmc.Var(term.name+"#"+(ctx.size+1)), expr_cmp.type);
       var body_ctx = fmc.Ext({name:term.name,type:expr_var.type}, ctx);
       var body_cmp = check(term.body(expr_var), type, defs, body_ctx);
       return {
-        comp: term.dups ? Let(term.name+"$"+(ctx.size+1), expr_cmp.comp, body_cmp.comp) : body_cmp.comp,
+        comp: Let(term.name+"$"+(ctx.size+1), expr_cmp.comp, body_cmp.comp),
         type: body_cmp.type,
       };
     case "Loc":

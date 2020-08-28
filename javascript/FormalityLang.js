@@ -10,6 +10,7 @@ var {
   Err,
   typeinfer,
   typecheck,
+  typesynth,
   equal,
   find,
   fold,
@@ -38,8 +39,13 @@ function get_var(ctx, name, not_found) {
 };
 
 // Is this a space character?
+// Unicode whitespace characters from https://en.wikipedia.org/wiki/Whitespace_character
 function is_space(chr) {
-  return chr === " " || chr === "\t" || chr === "\n";
+  var whitespace = " \t\n\r\v\f\u0085\u00A0\u1680\u2000\u2001\u2002\u2003"  +
+                   "\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029" +
+                   "\u2028\u2029\u202F\u205F\u3000\u180E\u200B\u200C\u200D" +
+                   "\u2060\uFEFF"
+  return (whitespace.indexOf(chr) !== -1)
 };
 
 // Is this a name-valid character?
@@ -180,7 +186,7 @@ function parse_opt(code, [indx,tags], str, err) {
 };
 
 // Parses comma separated arguments `(x,y,z)` or `<x,y,z>`
-function parse_app_list(parser) {
+function parse_arg(parser) {
   return (code, [indx,tags], err) => {
     var parse_next = (code, [indx,tags], err) =>
       chain(parse_txt(code,next(code,[indx,tags]),",",err), ([indx,tags], skip) =>
@@ -231,7 +237,7 @@ function parse_nam(code, [indx,tags], allow_empty = false, err = false, tag = "n
 };
 
 // Parses a parenthesis, `(<term>)`
-function parse_par(code, [indx,tags], err = false) {
+function parse_grp(code, [indx,tags], err = false) {
   return (
     chain(parse_txt(code, next(code, [indx,tags]), "(", false), ([indx,tags], skip) =>
     chain(parse_trm(code, [indx,tags], err), ([indx,tags], term) =>
@@ -244,7 +250,7 @@ function parse_all(code, [indx,tags], err = false) {
   var from = next(code, [indx,tags])[0];
   return (
     chain(parse_nam(code, next(code, [indx,tags]), true, false), ([indx,tags], self) =>
-    chain(parse_app_list(parse_bnd)(code, [indx,tags], false), ([indx,tags], [eras,binds]) =>
+    chain(parse_arg(parse_bnd)(code, [indx,tags], false), ([indx,tags], [eras,binds]) =>
     chain(parse_txt(code, next(code, [indx,tags]), "->", false), ([indx,tags], skip) =>
     chain(parse_trm(code, [indx,tags], err), ([indx,tags], body) =>
     [[indx,tags], xs => {
@@ -270,14 +276,14 @@ function parse_lam(code, [indx,tags], err = false) {
       chain(parse_trm(code, next(code,[indx,tags]), err), ([indx,tags],bind) =>
       [[indx,tags],bind])));
   };
-  function parse_arg(code, [indx,tags], err) {
+  function parse_fxs(code, [indx,tags], err) {
     return (
       chain(parse_nam(code, next(code,[indx,tags]), true, err), ([indx,tags],name) =>
       chain(parse_may(parse_bnd)(code, next(code, [indx,tags]), err), ([indx,tags], bind) =>
       [[indx,tags],[name,bind]])));
   };
   return (
-    chain(parse_app_list(parse_arg)(code, next(code, [indx,tags]), false), ([indx,tags], [eras, args]) =>
+    chain(parse_arg(parse_fxs)(code, next(code, [indx,tags]), false), ([indx,tags], [eras, args]) =>
     chain(parse_trm(code, next(code,[indx,tags]), err), ([indx,tags], body) =>
     [[indx,tags], (xs) => {
        function make(ctx,i) {
@@ -305,7 +311,7 @@ function parse_fun(code, [indx,tags], err = false) {
   var pnam = (c,i,e) => parse_nam(c,next(c,i),true,e)
   return (
     chain(parse_nam(code, next(code, [indx,tags]), true, false), ([indx,tags], self) =>
-    chain(parse_app_list(pnam)(code, next(code, [indx,tags]), false), ([indx,tags], [eras, binds]) =>
+    chain(parse_arg(pnam)(code, next(code, [indx,tags]), false), ([indx,tags], [eras, binds]) =>
     chain(parse_txt(code, next(code, [indx,tags]), "=>", false), ([indx,tags], skip) =>
     chain(parse_trm(code, next(code,[indx,tags]), err), ([indx,tags], body) =>
     [[indx,tags], (xs) => {
@@ -316,6 +322,28 @@ function parse_fun(code, [indx,tags], err = false) {
       return Loc(from, indx, fold(xs,0))
     }])))));
 };
+
+// Parses a pair, `{<term>, <term>}`
+function parse_par(code, [indx,tags], err = false) {
+  var from = next(code, [indx,tags])[0];
+  return (
+    chain(parse_txt(code, next(code, [indx,tags]), "{", false), ([indx,tags], skip) =>
+    chain(parse_trm(code, next(code, [indx,tags]), false), ([indx,tags], val0) =>
+    chain(parse_txt(code, next(code, [indx,tags]), ",", false), ([indx,tags], skip) =>
+    chain(parse_trm(code, next(code, [indx,tags]), err), ([indx,tags], val1) =>
+    chain(parse_txt(code, next(code, [indx,tags]), "}", false), ([indx,tags], skip) => {
+      let nam0 = new_name();
+      let nam1 = new_name();
+      return [[indx,tags], (xs) => {
+        var term = Ref("Pair.new");
+        var term = App(true, term, hole(nam0, xs))
+        var term = App(true, term, hole(nam1, xs))
+        var term = App(false, term, val0(xs));
+        var term = App(false, term, val1(xs));
+        return Loc(from, indx, term);
+      }]
+    }))))));
+}
 
 // Parses an arrow comment, `<name> => <term>`
 function parse_acm(code, [indx,tags], err = false) {
@@ -440,6 +468,166 @@ function parse_us0(code, [indx,tags], err = false) {
     }])))));
 };
 
+// Parses a for loop, `for i = 0 .. 10 with val: f(i, val)`
+// ~> `let val = Nat.for<>(val, 0, 10, (i, val) f(i,val)); val`
+function parse_for(type, callfunc) {
+  return function parse_for(code, [indx,tags], err = false) {
+    function parse_typ(code, [indx,tags], err) {
+      if (type) {
+        return (
+          chain(parse_txt(code, next(code, [indx,tags]), ":", err), ([indx,tags], skip) =>
+          chain(parse_txt(code, next(code, [indx,tags]), type, err), ([indx,tags], skip) =>
+          [[indx,tags], null])));
+      } else {
+        return [[indx,tags], null];
+      }
+    };
+    var from = next(code, [indx,tags])[0];
+    return (
+      chain(parse_txt(code, next(code, [indx,tags]), "for ", false), ([indx,tags], skip) =>
+      chain(parse_nam(code, next(code, [indx,tags]), false, false), ([indx,tags], fidx) =>
+      chain(parse_typ(code, next(code, [indx,tags]), false), ([indx,tags], skip) => 
+      chain(parse_txt(code, next(code, [indx,tags]), "=", false), ([indx,tags], skip) =>
+      chain(parse_trm(code, [indx,tags], err), ([indx,tags], lim0) =>
+      chain(parse_txt(code, next(code, [indx,tags]), "..", err), ([indx,tags], skip) =>
+      chain(parse_trm(code, [indx,tags], err), ([indx,tags], lim1) =>
+      chain(parse_txt(code, next(code, [indx,tags]), "with", err), ([indx,tags], skip) =>
+      chain(parse_nam(code, next(code, [indx,tags]), false, err), ([indx,tags], name) =>
+      chain(parse_txt(code, next(code, [indx,tags]), ":", err), ([indx,tags], skip) =>
+      chain(parse_trm(code, [indx,tags], err), ([indx,tags], loop) => {
+        let nam0 = new_name();
+        return [[indx,tags], xs => {
+          var term = Ref(callfunc);
+          var term = App(true, term, hole(nam0, xs));
+          var term = App(false, term, get_var(xs, name));
+          var term = App(false, term, lim0(xs));
+          var term = App(false, term, lim1(xs));
+          var lamb = Lam(false, fidx, i =>
+                    Lam(false, name, x =>
+                    loop(Ext([fidx,i], Ext([name,x], xs)))));
+          var term = App(false, term, lamb);
+          var term = Let(name, term, x => get_var(Ext([name,x], xs), name));
+          return Loc(from, indx, term);
+        }];
+      }))))))))))));
+  };
+};
+
+// Parses a for-in loop, `for x in list with state: f(x, state)`
+// ~> `let state = List.for<,>(state, (x, state) f(x, state), list); state`
+function parse_fin(code, [indx,tags], err = false) {
+  var from = next(code, [indx,tags])[0];
+  return (
+    chain(parse_txt(code, next(code, [indx,tags]), "for ", false), ([indx,tags], skip) =>
+    chain(parse_nam(code, next(code, [indx,tags]), false, false), ([indx,tags], elem) =>
+    chain(parse_txt(code, next(code, [indx,tags]), "in", false), ([indx,tags], skip) =>
+    chain(parse_trm(code, [indx,tags], err), ([indx,tags], list) =>
+    chain(parse_txt(code, next(code, [indx,tags]), "with", err), ([indx,tags], skip) =>
+    chain(parse_nam(code, next(code, [indx,tags]), false, err), ([indx,tags], name) =>
+    chain(parse_txt(code, next(code, [indx,tags]), ":", err), ([indx,tags], skip) =>
+    chain(parse_trm(code, [indx,tags], err), ([indx,tags], loop) => {
+      let nam0 = new_name();
+      let nam1 = new_name();
+      return [[indx,tags], xs => {
+        var term = Ref("List.for");
+        var term = App(true, term, hole(nam0, xs));
+        var term = App(false, term, list(xs));
+        var term = App(true, term, hole(nam1, xs));
+        var term = App(false, term, get_var(xs, name));
+        var lamb =
+          Lam(false, elem, i =>
+          Lam(false, name, x =>
+          loop(Ext([elem,i], Ext([name,x], xs)))));
+        var term = App(false, term, lamb);
+        var term = Let(name, term, x => get_var(Ext([name,x], xs), name));
+        return Loc(from, indx, term);
+      }];
+    })))))))));
+};
+
+// Parses a let for loop, `let val = for i = 0 .. 10: f(i, val)`
+// ~> `let val = Nat.for<>(val, 0, 10, (i, val) f(i,val))`
+function parse_lfr(type, callfunc) {
+  return function parse_lfr(code, [indx,tags], err = false) {
+    function parse_typ(code, [indx,tags], err) {
+      if (type) {
+        return (
+          chain(parse_txt(code, next(code, [indx,tags]), ":", err), ([indx,tags], skip) =>
+          chain(parse_txt(code, next(code, [indx,tags]), type, err), ([indx,tags], skip) =>
+          [[indx,tags], null])));
+      } else {
+        return [[indx,tags], null];
+      }
+    };
+    var from = next(code, [indx,tags])[0];
+    return (
+      chain(parse_txt(code, next(code, [indx,tags]), "let ", false), ([indx,tags], skip) =>
+      chain(parse_nam(code, next(code, [indx,tags]), false, false), ([indx,tags], name) =>
+      chain(parse_txt(code, next(code, [indx,tags]), "=", false), ([indx,tags], skip) =>
+      chain(parse_txt(code, next(code, [indx,tags]), "for ", false), ([indx,tags], skip) =>
+      chain(parse_nam(code, next(code, [indx,tags]), false, false), ([indx,tags], fidx) =>
+      chain(parse_typ(code, next(code, [indx,tags]), false), ([indx,tags], skip) => 
+      chain(parse_txt(code, next(code, [indx,tags]), "=", false), ([indx,tags], skip) =>
+      chain(parse_trm(code, [indx,tags], err), ([indx,tags], lim0) =>
+      chain(parse_txt(code, next(code, [indx,tags]), "..", err), ([indx,tags], skip) =>
+      chain(parse_trm(code, [indx,tags], err), ([indx,tags], lim1) =>
+      chain(parse_txt(code, next(code, [indx,tags]), ":", err), ([indx,tags], skip) =>
+      chain(parse_trm(code, [indx,tags], err), ([indx,tags], loop) =>
+      chain(parse_opt(code, [indx,tags], ";", err), ([indx,tags], skip) => 
+      chain(parse_trm(code, [indx,tags], err), ([indx,tags], body) => {
+        let nam0 = new_name();
+        return [[indx,tags], xs => {
+          var term = Ref(callfunc);
+          var term = App(true, term, hole(nam0, xs));
+          var term = App(false, term, get_var(xs, name));
+          var term = App(false, term, lim0(xs));
+          var term = App(false, term, lim1(xs));
+          var lamb = Lam(false, fidx, i =>
+                    Lam(false, name, x =>
+                    loop(Ext([fidx,i], Ext([name,x], xs)))));
+          var term = App(false, term, lamb);
+          var term = Let(name, term, x => body(Ext([name,x], xs)));
+          return Loc(from, indx, term);
+        }];
+      })))))))))))))));
+  };
+};
+
+// Parses a let for-in loop, `let state = for x in list: f(x, state)`
+// ~> `let state = List.for<,>(state, (x, state) f(x, state), list)`
+function parse_lfn(code, [indx,tags], err = false) {
+  var from = next(code, [indx,tags])[0];
+  return (
+    chain(parse_txt(code, next(code, [indx,tags]), "let ", false), ([indx,tags], skip) =>
+    chain(parse_nam(code, next(code, [indx,tags]), false, false), ([indx,tags], name) =>
+    chain(parse_txt(code, next(code, [indx,tags]), "=", false), ([indx,tags], skip) =>
+    chain(parse_txt(code, next(code, [indx,tags]), "for ", false), ([indx,tags], skip) =>
+    chain(parse_nam(code, next(code, [indx,tags]), false, false), ([indx,tags], elem) =>
+    chain(parse_txt(code, next(code, [indx,tags]), "in", false), ([indx,tags], skip) =>
+    chain(parse_trm(code, [indx,tags], err), ([indx,tags], list) =>
+    chain(parse_txt(code, next(code, [indx,tags]), ":", err), ([indx,tags], skip) =>
+    chain(parse_trm(code, [indx,tags], err), ([indx,tags], loop) =>
+    chain(parse_opt(code, [indx,tags], ";", err), ([indx,tags], skip) => 
+    chain(parse_trm(code, [indx,tags], err), ([indx,tags], body) => {
+      let nam0 = new_name();
+      let nam1 = new_name();
+      return [[indx,tags], xs => {
+        var term = Ref("List.for");
+        var term = App(true, term, hole(nam0, xs));
+        var term = App(false, term, list(xs));
+        var term = App(true, term, hole(nam1, xs));
+        var term = App(false, term, get_var(xs, name));
+        var lamb =
+          Lam(false, elem, i =>
+          Lam(false, name, x =>
+          loop(Ext([elem,i], Ext([name,x], xs)))));
+        var term = App(false, term, lamb);
+        var term = Let(name, term, x => body(Ext([name,x], xs)));
+        return Loc(from, indx, term);
+      }];
+    }))))))))))));
+};
+
 // Parses a projection, `get a = x; y` ~> `x<() _>((a) y)`
 function parse_gt1(code, [indx,tags], err = false) {
   var from = next(code, [indx,tags])[0];
@@ -560,6 +748,11 @@ function parse_hol(code, [indx,tags], err) {
 // Parses an case expression, `case x as t : m;` ~> `x<(t) m>`
 function parse_cse(code, [indx,tags], err) {
   var from = next(code, [indx,tags])[0];
+  function parse_opn(code, [indx, tags], err) {
+    return (
+      chain(parse_trm(code, next(code, [indx,tags]), err), ([indx,tags], term) =>
+      [[indx,tags], [term]]));
+  };
   function parse_bar(code, [indx, tags], err) {
     return (
       chain(parse_txt(code, next(code, [indx,tags]), "|", false), ([indx,tags], skip) =>
@@ -604,10 +797,10 @@ function parse_cse(code, [indx,tags], err) {
     ]);
   };
   return (
-    chain(parse_txt(code, next(code, [indx,tags]), "case ", false), ([indx,tags], skip) =>
+    chain(parse_one(code, next(code, [indx,tags]), "case ", "open ", false), ([indx,tags], open) =>
     chain(parse_val(code, next(code, [indx,tags]), err), ([indx,tags], cval) =>
     chain(parse_mny(parse_wth)(code, [indx,tags], err), ([indx,tags], wths) =>
-    chain(parse_mny(parse_bar)(code, [indx,tags], err), ([indx,tags], bars) =>
+    chain((open ? parse_opn : parse_mny(parse_bar))(code, [indx,tags], err), ([indx,tags], bars) =>
     chain(parse_may(parse_mot)(code, [indx,tags], err), ([indx,tags], moti) => {
       var uniq_name = new_name();
       var hole_name = new_name();
@@ -732,13 +925,30 @@ function parse_don(code, [indx,tags], err = false) {
     [[indx,tags], xs => Loc(from, indx, term(xs))]))))));
 };
 
-function parsed_var(from, [indx,tags], name) {
+function parsed_var(from, [indx,tags], name, sign = true) {
   return xs => {
     if (tags && tags.head) tags.head.ctor = "var";
     return Loc(from, indx, get_var(xs, name, () => {
       if (/^[0-9]*$/.test(name)) {
         if (tags && tags.head) tags.head.ctor = "nat";
         return Nat(BigInt(name));
+      } else if (/^[0-9]*[bsulijfde]$/.test(name)) {
+        var conv = null;
+        switch (name[name.length - 1]) {
+          case "b": conv = "Nat.to_u8"; break;
+          case "s": conv = "Nat.to_u16"; break;
+          case "u": conv = "Nat.to_u32"; break;
+          case "l": conv = "Nat.to_u64"; break;
+          case "e": conv = "Nat.to_u256"; break;
+        }
+        return App(false, Ref(conv), Nat(BigInt(name.slice(0,-1))));
+      } else if (/^[0-9]*\.[0-9]*$/.test(name)) {
+        var [a,b] = name.split(".");
+        var term = Ref("Nat.to_f64");
+        var term = App(false, term, Ref(sign ? "Bool.true" : "Bool.false"));
+        var term = App(false, term, Nat(BigInt(a + b)));
+        var term = App(false, term, Nat(BigInt(b.length)));
+        return term;
       } else {
         if (tags && tags.head) tags.head.ctor = "ref";
         return Ref(name);
@@ -751,14 +961,15 @@ function parsed_var(from, [indx,tags], name) {
 function parse_var(code, [indx,tags], err = false) {
   var from = next(code, [indx,tags])[0];
   return (
+    chain(parse_opt(code, next(code, [indx,tags]), "-", false), ([indx,tags], negs) =>
     chain(parse_nam(code, next(code, [indx,tags]), false, false), ([indx,tags], name) => {
       if (name.length === 0) {
         return parse_error(code, indx, "a variable", err);
       } else {
         var tag_to_mutate = tags && tags.head;
-        return [[indx,tags], parsed_var(from, [indx,tags], name)]
+        return [[indx,tags], parsed_var(from, [indx,tags], name, !negs)]
       };
-    }));
+    })));
 };
 
 // Parses a single-line hole application, `<term>()`
@@ -881,7 +1092,7 @@ function parse_ie6(code, [indx,tags], from, func, err) {
 // Parses a application `f(x,y,z) ~> f(x)(y)(z)`
 function parse_app(code, [indx,tags], from, func, err) {
   return (
-    chain(parse_app_list(parse_trm)(code,[indx,tags],err), ([indx,tags], [eras,args]) =>
+    chain(parse_arg(parse_trm)(code,[indx,tags],err), ([indx,tags], [eras,args]) =>
       [[indx,tags], (xs) => {
         var x = func(xs);
         for (var i = 0; i < args.length; i++) {
@@ -920,14 +1131,53 @@ function parse_ann(code, [indx,tags], from, expr, err) {
     [[indx,tags], xs => Loc(from, indx, Ann(false, expr(xs), type(xs)))])));
 };
 
+// Parses an equality, `<term> == <term>`
+function parse_yeq(code, [indx,tags], from, expr, err) {
+  return (
+    chain(parse_txt(code, next(code, [indx,tags]), "==", false), ([indx,tags], skip) =>
+    chain(parse_trm(code, [indx,tags], err), ([indx,tags], eqto) => {
+      var nam0 = new_name();
+      return [[indx,tags], xs => {
+        var term = Ref("Equal");
+        var term = App(false, term, hole(nam0, xs))
+        var term = App(false, term, expr(xs));
+        var term = App(false, term, eqto(xs));
+        return Loc(from, indx, term);
+      }];
+    })));
+};
+
+// Parses a non equality, `<term> != <term>`
+function parse_neq(code, [indx,tags], from, expr, err) {
+  return (
+    chain(parse_txt(code, next(code, [indx,tags]), "!=", false), ([indx,tags], skip) =>
+    chain(parse_trm(code, [indx,tags], err), ([indx,tags], eqto) => {
+      var nam0 = new_name();
+      return [[indx,tags], xs => {
+        var term = Ref("Equal");
+        var term = App(false, term, hole(nam0, xs))
+        var term = App(false, term, expr(xs));
+        var term = App(false, term, eqto(xs));
+        var term = App(false, Ref("Not"), term);
+        return Loc(from, indx, term);
+      }];
+    })));
+};
+
 // Parses a char literal, 'f'
 function parse_chr(code, [indx,tags], err) {
   var from = next(code, [indx,tags])[0];
+  function esc(code,[indx,tags],err) {
+    return (
+    chain(parse_txt(code, [indx,tags], "\\"), ([indx,tags], skip) =>
+    chain(parse_esc(code, [indx,tags], err,false), ([indx,tags], e) =>
+    [[indx,tags],e])))
+  }
   return (
     chain(parse_txt(code, next(code, [indx,tags]), "'"), ([indx,tags], skip) =>
-    chain([[indx+1,tags&&Ext(Tag("chr",code[indx]),tags)], code[indx]], ([indx,tags], chrx) =>
+    chain(choose([() => esc(code,[indx,tags],err), () => [[indx+1,tags],code[indx]]]), ([indx,tags], chrx) =>
     chain(parse_txt(code, next(code, [indx,tags]), "'"), ([indx,tags], skip) =>
-    [[indx,tags], xs => Loc(from, indx, Ann(true, Chr(chrx), Ref("Char")))]
+    [[indx,tags&&Ext(Tag("chr",code[indx]),tags)], xs => Loc(from, indx, Chr(chrx))]
     ))));
 };
 
@@ -938,16 +1188,125 @@ function parse_str(code, [indx,tags], err) {
     chain(parse_txt(code, next(code, [indx,tags]), "\""), ([indx,tags], skip) =>
     chain((function go([indx,tags], slit) {
       var strx = "";
-      while (code[indx] !== '"') {
+      while (true) {
         if (indx >= code.length) {
           parse_error(code, indx, "unterminated string literal", true);
+        } else if (code[indx] == '\\') {
+          var esc = parse_esc(code,[indx+1,tags],err,true)
+          if (esc) {
+            var [[esc_indx,_],esc_char] = esc;
+            strx += esc_char;
+            indx = esc_indx;
+          } else {
+            parse_error(code, indx, "valid string escape sequence", true);
+          }
+        } else if (code[indx] == '"') {
+          break;
         } else {
           strx += code[indx++];
         }
       }
+      //console.log(strx);
       return [[indx+1,tags&&Ext(Tag("txt",'"'),Ext(Tag("str",strx),tags))], Str(strx)];
     })([indx,tags]), ([indx,tags], slit) =>
-    [[indx,tags], xs => Loc(from, indx, Ann(true, slit, Ref("String")))])));
+    [[indx,tags], xs => Loc(from, indx, slit)])));
+};
+
+// Parses a string escape sequence, `\n`, `\DEL`, `\xABCDE
+function parse_esc(code,[indx,tags],err,is_string) {
+  var escs =
+    [["b","\b"],    ["f","\f"],    ["n","\n"],    ["r","\r"],    ["t","\t"],
+     ["v","\v"],    ["\\","\\"],   ["\"","\""],   ["0","\0"],["'","'"],
+     ["NUL","\x00"],["SOH","\x01"],["STX","\x02"],["ETX","\x03"],["EOT","\x04"],
+     ["ENQ","\x05"],["ACK","\x06"],["BEL","\x07"],["BS", "\x08"],["HT", "\x09"],
+     ["LF", "\x0A"],["VT", "\x0B"],["FF", "\x0C"],["CR", "\x0D"],["SO", "\x0E"],
+     ["SI", "\x0F"],["DLE","\x10"],["DC1","\x11"],["DC2","\x12"],["DC3","\x13"],
+     ["DC4","\x14"],["NAK","\x15"],["SYN","\x16"],["ETB","\x17"],["CAN","\x18"],
+     ["EM", "\x19"],["SUB","\x1A"],["ESC","\x1B"],["FS", "\x1C"],["GS", "\x1D"],
+     ["RS", "\x1E"],["US", "\x1F"],["SP", "\x20"],["DEL","\x7F"]]
+  if (is_string) {
+    escs.push(["&",""])
+  }
+  function hex(code,[indx,tags],err) {
+    return (
+      chain(parse_txt(code,[indx,tags],"x",false),([indx,tags],skip) =>
+      chain(parse_hex(code,[indx,tags],false),    ([indx,tags],pnt)  =>
+      (pnt <= 0x10FFFFn) ? [[indx,tags], String.fromCodePoint(Number(pnt))] : null
+    )))
+  };
+  function unc(code,[indx,tags],err) {
+    return (
+      chain(parse_txt(code,[indx,tags],"u{",false),([indx,tags],skip) =>
+      chain(parse_hex(code,[indx,tags],false),    ([indx,tags],pnt)  =>
+      chain(parse_txt(code,[indx,tags],"}",false),([indx,tags],skip) =>
+      (pnt <= 0x10FFFFn) ? [[indx,tags], String.fromCodePoint(Number(pnt))] : null
+    ))))
+  };
+  return (choose([
+      () => choose(escs.map(([a,b]) => () =>
+            chain(parse_txt(code,[indx,tags],a,false), ([indx,tags],_) => 
+            [[indx,tags],b]))),
+      () => hex(code,[indx,tags],err),
+      () => unc(code,[indx,tags],err)
+    ]));
+};
+
+// parse binary literal
+function parse_bin(code,[indx,tags],err) {
+  var from = next(code, [indx,tags])[0];
+  var digs = [['0',0n],['1',1n]]
+  function dig(code,[indx,tags],err) {
+    return (choose(digs.map(([a,b]) => () =>
+      chain(parse_txt(code,[indx,tags],a,err), ([indx,tags],_) =>
+      [[indx,tags],b]))))
+  };
+  return (
+    chain(dig(code,[indx,tags],err), ([indx,tags],d) =>
+    chain(parse_mny(dig)(code,[indx,tags],err), ([indx,tags],ds) => { 
+      ds.unshift(d);
+      var [_,num] = ds.reduceRight(([p,a],v) => [p+1n,a + v * 2n**p],[0n,0n]);
+      return [[indx,tags], num];
+    })))
+}
+
+// Parses a decimal number
+function parse_dec(code,[indx,tags],err) { 
+  var from = next(code, [indx,tags])[0];
+  var digs = [['0',0n],['1',1n],['2',2n],['3',3n],['4',4n],
+              ['5',5n],['6',6n],['7',7n],['8',8n],['9',9n]]
+  function dig(code,[indx,tags],err) {
+    return (choose(digs.map(([a,b]) => () =>
+      chain(parse_txt(code,[indx,tags],a,err), ([indx,tags],_) =>
+      [[indx,tags],b]))))
+  };
+  return (
+    chain(dig(code,[indx,tags],err), ([indx,tags],d) =>
+    chain(parse_mny(dig)(code,[indx,tags],err), ([indx,tags],ds) => { 
+      ds.unshift(d);
+      var [_,num] = ds.reduceRight(([p,a],v) => [p+1n,a + v * 10n**p],[0n,0n]);
+      return [[indx,tags], num];
+    })))
+};
+
+function parse_hex(code,[indx,tags],err) {
+  var from = next(code, [indx,tags])[0];
+  var digs = [['0',0n],['1',1n],['2',2n],['3',3n],['4',4n],
+              ['5',5n],['6',6n],['7',7n],['8',8n],['9',9n],
+              ['a',10n],['b',11n],['c',12n],['d',13n],['e',14n],['f',15n],
+              ['A',10n],['B',11n],['C',12n],['D',13n],['E',14n],['F',15n]
+              ]
+  function dig(code,[indx,tags],err) {
+    return (choose(digs.map(([a,b]) => () =>
+      chain(parse_txt(code,[indx,tags],a,err), ([indx,tags],_) =>
+      [[indx,tags],b]))))
+  };
+  return (
+    chain(dig(code,[indx,tags],err), ([indx,tags],d) =>
+    chain(parse_mny(dig)(code,[indx,tags],err), ([indx,tags],ds) => { 
+      ds.unshift(d);
+      var [_,num] = ds.reduceRight(([p,a],v) => [p+1n,a + v * 16n**p],[0n,0n]);
+      return [[indx,tags], num];
+    })))
 };
 
 // Parses a list literal, `[a, b, c]` as a `List(A)`
@@ -1036,7 +1395,22 @@ function parse_trm(code, [indx = 0, tags = []], err) {
     () => parse_all(code, [indx,tags], err),
     () => parse_lam(code, [indx,tags], err),
     () => parse_fun(code, [indx,tags], err),
+    () => parse_par(code, [indx,tags], err),
     () => parse_acm(code, [indx,tags], err),
+    () => parse_for(null,"Nat.for")(code, [indx,tags], err),
+    () => parse_for("U8","U8.for")(code, [indx,tags], err),
+    () => parse_for("U16","U16.for")(code, [indx,tags], err),
+    () => parse_for("U32","U32.for")(code, [indx,tags], err),
+    () => parse_for("U64","U64.for")(code, [indx,tags], err),
+    () => parse_for("F64","F64.for")(code, [indx,tags], err),
+    () => parse_fin(code, [indx,tags], err),
+    () => parse_lfr(null,"Nat.for")(code, [indx,tags], err),
+    () => parse_lfr("U8","U8.for")(code, [indx,tags], err),
+    () => parse_lfr("U16","U16.for")(code, [indx,tags], err),
+    () => parse_lfr("U32","U32.for")(code, [indx,tags], err),
+    () => parse_lfr("U64","U64.for")(code, [indx,tags], err),
+    () => parse_lfr("F64","F64.for")(code, [indx,tags], err),
+    () => parse_lfn(code, [indx,tags], err),
     () => parse_let(code, [indx,tags], err),
     () => parse_us0(code, [indx,tags], err),
     () => parse_us1(code, [indx,tags], err),
@@ -1047,7 +1421,7 @@ function parse_trm(code, [indx = 0, tags = []], err) {
     () => parse_gt2(code, [indx,tags], err),
     () => parse_gt3(code, [indx,tags], err),
     () => parse_gt4(code, [indx,tags], err),
-    () => parse_par(code, [indx,tags], err),
+    () => parse_grp(code, [indx,tags], err),
     () => parse_typ(code, [indx,tags], err),
     () => parse_chr(code, [indx,tags], err),
     () => parse_str(code, [indx,tags], err),
@@ -1082,6 +1456,8 @@ function parse_trm(code, [indx = 0, tags = []], err) {
         () => parse_pip(code, [indx,tags], from, term, err),
         () => parse_arr(code, [indx,tags], from, term, err),
         () => parse_ann(code, [indx,tags], from, term, err),
+        () => parse_yeq(code, [indx,tags], from, term, err),
+        () => parse_neq(code, [indx,tags], from, term, err),
       ], err);
       if (!post_parse) {
         return base_parse;
@@ -1097,7 +1473,7 @@ function parse_trm(code, [indx = 0, tags = []], err) {
 // Parses a sequence of `<x: term, y: term...> (a: term, b: term...) ...`.
 // Returns a list of erasure/bind/term: `[{eras:bool, name:text, term:term}]`.
 function parse_bds(code, [indx,tags], err) {
-  var parser = parse_mny(parse_app_list(parse_bnd));
+  var parser = parse_mny(parse_arg(parse_bnd));
   return chain(parser(code, next(code, [indx,tags]), err), ([indx,tags], bnds) => {
     // [(bool,[(string,term)])] -> [(bool,string,term)]
     var flat_bnds = [];
@@ -1117,7 +1493,7 @@ function parse_bds(code, [indx,tags], err) {
 // Parses a sequence of `<term, term...> (term, term...) ...`.
 // Returns a list of erasure/term: `[(bool, term)]`.
 function parse_ars(code, [indx,tags], err) {
-  var parser = parse_mny(parse_app_list(parse_trm));
+  var parser = parse_mny(parse_arg(parse_trm));
   return chain(parser(code, next(code, [indx,tags]), err), ([indx,tags], args) => {
     // [(bool,[term])] -> [(bool, term)]
     var flat_args = [];
@@ -1161,6 +1537,16 @@ function parse_adt(code, [indx,tags], err) {
 function parse(code, indx = 0, tags_list = Nil()) {
   //var LOG = x => console.log(require("util").inspect(x, {showHidden: false, depth: null}));
   var defs = {};
+  function define(name, type, term){
+    if (defs[name]){
+      throw "Parse error: redefinition of "+name+".";
+    } else {
+      defs[name] = {
+        type: type,
+        term: term,
+      }
+    }
+  }
   function parse_defs(code, [indx,tags]) {
     var [indx,tags] = next(code, [indx,tags]);
     if (indx === code.length) {
@@ -1170,15 +1556,9 @@ function parse(code, indx = 0, tags_list = Nil()) {
       var parsed_adt = parse_adt(code, [indx,tags], true);
       if (parsed_adt) {
         var [[indx,tags], adt] = parsed_adt;
-        defs[adt.name] = {
-          type: adt_type_type(adt),
-          term: adt_type_term(adt),
-        };
+        define(adt.name, adt_type_type(adt), adt_type_term(adt));
         for (var c = 0; c < adt.ctrs.length; ++c) {
-          defs[adt.name+"."+adt.ctrs[c].name] = {
-            type: adt_ctor_type(adt, c),
-            term: adt_ctor_term(adt, c),
-          };
+          define(adt.ctrs[c].name, adt_ctor_type(adt, c), adt_ctor_term(adt, c));
         }
         return parse_defs(code, [indx,tags]);
       // Parses function definitions
@@ -1189,10 +1569,7 @@ function parse(code, indx = 0, tags_list = Nil()) {
           chain(parse_txt(code, next(code, [indx,tags]), ":", true), ([indx,tags], skip) =>
           chain(parse_trm(code, next(code, [indx,tags]), true), ([indx,tags], type) =>
           chain(parse_trm(code, next(code, [indx,tags]), true), ([indx,tags], term) => {
-            defs[name] = {
-              type: def_type(bnds, type),
-              term: def_term(bnds, term),
-            };
+            define(name, def_type(bnds, type), def_term(bnds, term));
             return parse_defs(code, [indx,tags]);
           }))))));
       };
@@ -1224,6 +1601,15 @@ function parse(code, indx = 0, tags_list = Nil()) {
   return {defs, indx, tags};
 };
 
+function parse_and_synth(code) {
+  var {defs, indx, tags} = parse(code);
+  var core_defs = {};
+  for (var def in defs) {
+    core_defs[def] = typesynth(def, defs);
+  }
+  return {defs: core_defs, indx, tags};
+}
+
 // Stringification
 // ===============
 
@@ -1246,7 +1632,13 @@ function stringify_chr(chr) {
     }
   };
   if (chr.ctor === "Ref" && chr.name === "Char.new") {
-    return String.fromCharCode(val);
+    if (val == 92) {
+        return "\\\\"
+    } else if (val == 34) {
+        return "\\\""
+    } else {
+      return String.fromCharCode(val);
+    }
   } else {
     return null;
   };
@@ -1326,12 +1718,9 @@ function stringify_lst(term, type = null, vals = Nil()) {
       return stringify_lst(tail, type, Ext(head, vals));
     }],
     [nil, ({type}) => {
-      return "["
-        + stringify_trm(type) + ";"
-        + (vals.ctor === "Nil" ? "" : " ")
-        + fold(vals, b=>"", (h,t) => b => (b ? "" : ", ")
-        + stringify_trm(h)+t(0))(1)
-        + "]";
+      var strs = [];
+      fold(vals, null, (h,t) => strs.push(stringify_trm(h)));
+      return "["+strs.join(",")+"]";
     }]
   ]);
 };
@@ -1373,15 +1762,25 @@ function stringify_trm(term) {
         var rpar = term.eras ? ">" : ")";
         return lpar+name+rpar+" "+body;
       case "App":
-        var func = stringify_trm(term.func);
-        var lpar = term.eras ? "<" : "(";
-        var argm = stringify_trm(term.argm);
-        var rpar = term.eras ? ">" : ")";
-        if (func[0] === "(") {
-          return "("+func+")"+lpar+argm+rpar;
-        } else {
-          return func+lpar+argm+rpar;
+        var args = [];
+        while (term.ctor === "App") {
+          args.push([term.argm, term.eras]);
+          term = term.func;
         }
+        args.reverse();
+        var text = "";
+        for (var [argm, eras] of args) {
+          var last = text[text.length - 1];
+          if (eras && last === ">" || !eras && last === ")") {
+            text = text.slice(0,-1) + ",";
+          } else {
+            text += eras ? "<" : "(";
+          }
+          text += stringify_trm(argm);
+          text += eras ? ">" : ")";
+        }
+        var func = stringify_trm(term);
+        return (func[0] === "(" ? "("+func+")" : func) + text;
       case "Let":
         var name = term.name;
         var expr = stringify_trm(term.expr);
@@ -1404,6 +1803,8 @@ function stringify_trm(term) {
         return expr;
       case "Hol":
         return "_"+term.name; // +"{"+fold(term.vals,"",(h,t)=>stringify(h)+";"+t)+"}";
+      case "Cse":
+        return "<parsing_case>";
       case "Wat":
         return "?"+term.name;
       case "Nat":
@@ -1493,10 +1894,10 @@ function stringify_err(err, code) {
   }
   var index = 0;
   if (!err.ctx) {
-    if (__dirname.indexOf("vic/dev") !== -1) {
+    if (typeof err === "string" || __dirname.indexOf("vic/dev") !== -1) {
       return err;
     } else {
-      return "Undecidable.";
+      return "Internal error.";
     }
   } else {
     var str = "";
@@ -1607,7 +2008,7 @@ function adt_type_term({name, pars, inds, ctrs}) {
                     throw "Insufficient indices for constructor '" + ctrs[i].name + "'.";
                   }
                 }
-                var slf = Ref(name+"."+ctrs[i].name);
+                var slf = Ref(ctrs[i].name);
                 for (var P = 0; P < pars.length; ++P) {
                   slf = App(true, slf, get_var(ctx, pars[P].name));
                 }
@@ -1734,13 +2135,13 @@ module.exports = {
   drop_while,
   drop_spaces,
   next,
-  parse_app_list,
+  parse_arg,
   parse_error,
   parse_txt,
   parse_one,
   parse_opt,
   parse_nam,
-  parse_par,
+  parse_grp,
   parse_all,
   parse_lam,
   parse_let,
@@ -1755,6 +2156,10 @@ module.exports = {
   parse_ann,
   parse_chr,
   parse_str,
+  parse_esc,
+  parse_bin,
+  parse_dec,
+  parse_hex,
   parse_trm,
   parse,
   unloc,
@@ -1766,4 +2171,5 @@ module.exports = {
   stringify_defs,
   highlight_code,
   stringify_err,
+  parse_and_synth,
 };

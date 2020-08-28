@@ -100,15 +100,29 @@ function stringify(term, depth = 0) {
     case "Hol":
       return "_"+term.name;
     case "Cse":
-      return "<TODO:stringify.case>";
+      return "<parsing_case>";
     case "Nat":
       return ""+term.natx;
     case "Chr":
-      return "'"+term.chrx+"'";
+      return "'"+print_str(term.chrx)+"'"; 
     case "Str":
-      return '"'+term.strx+'"';
+      return '"'+print_str(term.strx)+'"';
   };
 };
+
+function print_str(str) {
+  var out = ""
+  for (var i = 0; i < str.length; i++) {
+    if (str[i] == '\\' || str[i] == '"' | str[i] == "'") {
+      out += '\\' + str[i];
+    } else if (str[i] >= ' ' && str[i] <= `~`) {
+      out += str[i];
+    } else {
+      out += "\\u{" + str.codePointAt(i).toString(16) + "}";
+    }
+  }
+  return out;
+}
 
 function parse(code, indx, mode = "defs") {
   function is_name(chr) {
@@ -127,15 +141,48 @@ function parse(code, indx, mode = "defs") {
     }
   };
   function parse_nuls() {
-    while (code[indx] === " " || code[indx] === "\n") {
+    while (" \n\r\t\v\f".indexOf(code[indx]) !== -1) {
       ++indx;
     };
   };
+  function parse_tokn() {
+    if (indx >= code.length) {
+      throw "Unexpected eof";
+    } else if (code[indx] == '\\') {
+      var esc = code[++indx];
+      switch (esc) {
+        case 'u':
+          indx++;
+          var skip = parse_char('{');
+          var point = ""
+          while (code[indx] !== '}') {
+            if ("0123456789abcdefABCDEF".indexOf(code[indx]) !== -1) {
+              point += code[indx++];
+            } else {
+              throw 'Expected hexadecimal Unicode codepoint", found '+
+                JSON.stringify(code[indx])+' at '+indx+': `'+code.slice(indx)+"`.";
+            }
+          }
+          indx++;
+          return String.fromCodePoint(parseInt(point,16));
+        case '\\':
+        case '"':
+        case "'":
+          indx++;
+          return esc;
+        default:
+         throw "Unexpected escape char: '\\" + code[indx+1] + "'.";
+      }
+    } else {
+      return code[indx++];
+    }
+  }
   function parse_char(chr) {
     if (indx >= code.length) {
       throw "Unexpected eof.";
     } else if (code[indx] !== chr) {
-      throw 'Expected "'+chr+'", found '+JSON.stringify(code[indx])+' at '+indx+': `'+code.slice(indx)+"`.";
+      throw 'Expected "'+chr+'", found '+JSON.stringify(code[indx])+' at '
+        +indx+': `'+code.slice(indx)+"`.";
     }
     ++indx;
   };
@@ -188,13 +235,14 @@ function parse(code, indx, mode = "defs") {
         var name = parse_name();
         return ctx => Hol(name, fold(ctx, Nil(), (h,t) => Ext(h[1],t)));
       case "'":
-        var chrx = code[indx++];
+        var chrx = parse_tokn();
         var skip = parse_char("'");
         return ctx => Chr(chrx);
       case '"':
         var strx = "";
+        //console.log(strx);
         while (code[indx] !== '"') {
-          strx += code[indx++];
+          strx += parse_tokn();
         }
         var skip = parse_char('"');
         return ctx => Str(strx);
@@ -312,6 +360,7 @@ function unloc(term) {
     case "Loc": return unloc(term.expr);
     case "Wat": return term;
     case "Hol": return term;
+    case "Cse": return term;
     case "Nat": return term;
     case "Chr": return term;
     case "Str": return term;
@@ -467,7 +516,7 @@ function normalize(term, defs, hols = {}, erased = false, seen = {}) {
 // - Applies static function calls (necessary for inference)
 // - Removes done Anns
 // - Removes Nat/Str if we're compiling to core
-function canonicalize(term, hols = {}, to_core = false) {
+function canonicalize(term, hols = {}, to_core = false, inline_lams = true) {
   switch (term.ctor) {
     case "Var":
       return Var(term.indx);
@@ -479,50 +528,49 @@ function canonicalize(term, hols = {}, to_core = false) {
       var eras = term.eras;
       var self = term.self;
       var name = term.name;
-      var bind = canonicalize(term.bind, hols, to_core);
-      var body = (s,x) => canonicalize(term.body(s,x), hols, to_core);
+      var bind = canonicalize(term.bind, hols, to_core, inline_lams);
+      var body = (s,x) => canonicalize(term.body(s,x), hols, to_core, inline_lams);
       return All(eras, self, name, bind, body);
     case "Lam":
       var eras = term.eras;
       var name = term.name;
-      var body = x => canonicalize(term.body(x), hols, to_core);
+      var body = x => canonicalize(term.body(x), hols, to_core, inline_lams);
       return Lam(eras, name, body);
     case "App":
       var eras = term.eras;
-      var func = canonicalize(term.func, hols, to_core);
-      var argm = canonicalize(term.argm, hols, to_core);
-      switch (func.ctor) {
-        case "Lam":
-          return canonicalize(func.body(term.argm), hols, to_core);
-        default:
-          return App(eras, func, argm);
+      var func = canonicalize(term.func, hols, to_core, inline_lams);
+      var argm = canonicalize(term.argm, hols, to_core, inline_lams);
+      if (inline_lams && func.ctor === "Lam") {
+        return canonicalize(func.body(term.argm), hols, to_core, inline_lams);
+      } else {
+        return App(eras, func, argm);
       };
     case "Let":
       var name = term.name;
-      var expr = canonicalize(term.expr, hols, to_core);
-      var body = x => canonicalize(term.body(x), hols, to_core);
+      var expr = canonicalize(term.expr, hols, to_core, inline_lams);
+      var body = x => canonicalize(term.body(x), hols, to_core, inline_lams);
       return Let(name, expr, body);
     case "Ann":
       if (term.done === true) {
-        return canonicalize(term.expr, hols, to_core);
+        return canonicalize(term.expr, hols, to_core, inline_lams);
       } else {
-        var expr = canonicalize(term.expr, hols, to_core);
-        var type = canonicalize(term.type, hols, to_core);
+        var expr = canonicalize(term.expr, hols, to_core, inline_lams);
+        var type = canonicalize(term.type, hols, to_core, inline_lams);
         return Ann(false, expr, type);
       }
     case "Loc":
-      return canonicalize(term.expr, hols, to_core);
+      return canonicalize(term.expr, hols, to_core, inline_lams);
     case "Wat":
       throw () => Err(null, null, "Incomplete program.");
     case "Hol":
       if (hols[term.name]) {
-        return canonicalize(hols[term.name](term.vals), hols, to_core);
+        return canonicalize(hols[term.name](term.vals), hols, to_core, inline_lams);
       } else {
         throw () => Err(null, null, "Unfilled hole: " + term.name + ".");
       }
     case "Cse":
       if (hols[term.name]) {
-        return canonicalize(build_cse(term, hols[term.name]), hols, to_core);
+        return canonicalize(build_cse(term, hols[term.name]), hols, to_core, inline_lams);
       } else {
         throw () => Err(null, null, "Incomplete case.");
       }
@@ -551,7 +599,7 @@ function canonicalize(term, hols = {}, to_core = false) {
     if (to_core) {
       var done = Ref("String.nil");
       for (var i = 0; i < term.strx.length; ++i) {
-        var chr = canonicalize(Chr(term.strx[term.strx.length-i-1]), hols, to_core);
+        var chr = canonicalize(Chr(term.strx[term.strx.length-i-1]), hols, to_core, inline_lams);
         done = App(false, App(false, Ref("String.cons"), chr), done);
       }
       return done;
@@ -569,7 +617,6 @@ function hash(term, dep = 0) {
   switch (term.ctor) {
     case "Var":
       var indx = Number(term.indx.split("#")[1]);
-      //console.log("ue", indx);
       if (indx < 0) {
         return "^"+(dep+indx);
       } else {
@@ -637,7 +684,6 @@ function equal(a, b, defs, hols, dep = 0, rec = {}) {
             && equal(a1.bind, b1.bind, defs, hols, dep+0, rec)
             && equal(a1_body, b1_body, defs, hols, dep+2, rec);
       case "LamLam":
-        if (a1.eras !== b1.eras) return [false,a1,b1];
         var a1_body = a1.body(Var(a1.name+"#"+(dep)));
         var b1_body = b1.body(Var(a1.name+"#"+(dep)));
         return a1.eras === b1.eras
@@ -649,8 +695,6 @@ function equal(a, b, defs, hols, dep = 0, rec = {}) {
       case "LetLet":
         var a1_body = a1.body(Var(a1.name+"#"+(dep)));
         var b1_body = b1.body(Var(a1.name+"#"+(dep)));
-        vis.push([a1.expr, b1.expr, dep]);
-        vis.push([a1_body, b1_body, dep+1]);
         return equal(a1.expr, b1.expr, defs, hols, dep+0, rec)
             && equal(a1_body, b1_body, defs, hols, dep+1, rec);
       case "AnnAnn":
@@ -752,7 +796,11 @@ function typeinfer(term, defs, show = stringify, hols = {}, ctx = Nil(), locs = 
       var got = defs[term.name];
       if (got) {
         if (got.core === undefined) {
-          var typ = typesynth(term.name, defs, show).type;
+          try {
+            var typ = typesynth(term.name, defs, show).type;
+          } catch (e) {
+            return fail(() => Err(locs, ctx, e().msg + "\nInside ref... \x1b[2m"+term.name+"\x1b[0m"));
+          }
         } else if (defs[term.name].core === null) {
           var typ = defs[term.name].type;
         } else {
@@ -832,11 +880,30 @@ function typeinfer(term, defs, show = stringify, hols = {}, ctx = Nil(), locs = 
         return deep([[typeinfer, [term_val, defs, show, hols, ctx, locs]]], done);
       });
     case "Nat":
-      return done([hols, Ref("Nat")]);
+      return (
+        deep([[typeinfer, [Ref("Nat"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Nat.zero"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Nat.succ"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        done([hols, Ref("Nat")])))));
     case "Chr":
-      return done([hols, Ref("Char")]);
+      return (
+        deep([[typeinfer, [Ref("Char"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Char.new"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Bit"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Bit.0"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Bit.1"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        done([hols, Ref("Char")])))))));
     case "Str":
-      return done([hols, Ref("String")]);
+      return (
+        deep([[typeinfer, [Ref("Char"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Char.new"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Bit"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Bit.0"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("Bit.1"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("String"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("String.nil"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        deep([[typeinfer, [Ref("String.cons"), defs, show, hols, ctx, locs]]], ([hols, _]) =>
+        done([hols, Ref("String")]))))))))));
   };
   return fail(() => Err(locs, ctx, "Can't infer type."));
 };
@@ -1004,16 +1071,21 @@ function typesynth(name, defs, show = stringify) {
     defs[name].core = null;
     var term = defs[name].term;
     var type = defs[name].type;
-    var [hols,_] = exec(() => 
-      deep([[typecheck, [type, Typ(), defs, show, {}, Nil(), null]]], ([hols,_]) =>
-      deep([[typecheck, [term, type, defs, show, {}, Nil(), null]]], ([hols,type]) => {
-        for (var hol in hols) {
-          if (hols[hol] === null) {
-            return fail(() => Err(null, ctx, "Unsolved hole: '" + hol + "'."));
+    try {
+      var [hols,_] = exec(() =>
+        deep([[typecheck, [type, Typ(), defs, show, {}, Nil(), null]]], ([hols,_]) =>
+        deep([[typecheck, [term, type, defs, show, hols, Nil(), null]]], ([hols,type]) => {
+          for (var hol in hols) {
+            if (hols[hol] === null) {
+              return fail(() => Err(null, Nil(), "Unsolved hole: '" + hol + "'."));
+            }
           }
-        }
-        return done([hols,type])
-      })));
+          return done([hols,type])
+        })));
+    } catch (e) {
+      delete defs[name].core;
+      throw e;
+    }
     var core_term = parse(stringify(canonicalize(term, hols)), 0, "term");
     var core_type = parse(stringify(canonicalize(type, hols)), 0, "term");
     defs[name].core = {term: core_term, type: core_type};
@@ -1085,4 +1157,5 @@ module.exports = {
   typesynth,
   HOLE_LOGS,
   clear_hole_logs,
+  print_str,
 };
